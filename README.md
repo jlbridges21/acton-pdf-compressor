@@ -133,8 +133,8 @@ If you use `COMPRESS_API_SECRET`, the frontend must also send the `x-compress-ap
 ## How compression works
 
 1. Upload is saved to a temporary file.
-2. Ghostscript compresses with `/ebook` preset (good quality, ~12 MB target for large decks).
-3. If the result is still over **20 MB**, Ghostscript retries with `/screen` (smaller, lower quality).
+2. Ghostscript compresses with `/ebook` preset at **300 dpi** (good quality, ~12 MB target for large decks).
+3. If the result is still over **12 MB**, Ghostscript retries with `/screen` (smaller, lower quality).
 4. The compressed PDF is returned as a download.
 5. Temporary files are deleted after the response is sent.
 

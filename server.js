@@ -13,8 +13,9 @@ const execFileAsync = promisify(execFile);
 const app = express();
 const PORT = process.env.PORT || 3000;
 
-// 20 MB — email-friendly ceiling; /screen is only used if /ebook exceeds this
-const MAX_EMAIL_SIZE_BYTES = 20 * 1024 * 1024;
+// 12 MB target — /screen is only used if /ebook at 300 dpi still exceeds this
+const MAX_EMAIL_SIZE_BYTES = 12 * 1024 * 1024;
+const IMAGE_DPI = 300;
 // 200 MB upload limit
 const MAX_UPLOAD_SIZE_BYTES = 200 * 1024 * 1024;
 
@@ -92,21 +93,29 @@ const upload = multer({
 // ---------------------------------------------------------------------------
 
 /** Run Ghostscript with the given quality preset (/ebook or /screen). */
-async function compressPdf(inputPath, outputPath, preset) {
-  await execFileAsync(
-    "gs",
-    [
-      "-sDEVICE=pdfwrite",
-      "-dCompatibilityLevel=1.4",
-      `-dPDFSETTINGS=${preset}`,
-      "-dNOPAUSE",
-      "-dQUIET",
-      "-dBATCH",
-      `-sOutputFile=${outputPath}`,
-      inputPath,
-    ],
-    { timeout: 5 * 60 * 1000 } // 5-minute timeout for large presentations
-  );
+async function compressPdf(inputPath, outputPath, preset, dpi = null) {
+  const args = [
+    "-sDEVICE=pdfwrite",
+    "-dCompatibilityLevel=1.4",
+    `-dPDFSETTINGS=${preset}`,
+    "-dNOPAUSE",
+    "-dQUIET",
+    "-dBATCH",
+  ];
+
+  if (dpi) {
+    args.push(
+      `-dColorImageResolution=${dpi}`,
+      `-dGrayImageResolution=${dpi}`,
+      `-dMonoImageResolution=${dpi}`
+    );
+  }
+
+  args.push(`-sOutputFile=${outputPath}`, inputPath);
+
+  await execFileAsync("gs", args, {
+    timeout: 5 * 60 * 1000, // 5-minute timeout for large presentations
+  });
 }
 
 async function getFileSizeBytes(filePath) {
@@ -133,14 +142,14 @@ async function cleanupFiles(...paths) {
 }
 
 /**
- * Compress with /ebook first. If the result is still over 20 MB, retry with /screen.
+ * Compress with /ebook at 300 dpi first. If still over 12 MB, retry with /screen.
  * Returns { outputPath, preset, originalSize, compressedSize }.
  */
 async function compressWithFallback(inputPath, workDir) {
   const originalSize = await getFileSizeBytes(inputPath);
 
   const ebookOutput = path.join(workDir, `ebook-${crypto.randomBytes(6).toString("hex")}.pdf`);
-  await compressPdf(inputPath, ebookOutput, "/ebook");
+  await compressPdf(inputPath, ebookOutput, "/ebook", IMAGE_DPI);
   const ebookSize = await getFileSizeBytes(ebookOutput);
 
   if (ebookSize <= MAX_EMAIL_SIZE_BYTES) {
