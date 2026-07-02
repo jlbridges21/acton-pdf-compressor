@@ -70,7 +70,9 @@ The `-D -` flag prints response headers so you can see:
 
 - `X-Original-Size-MB`
 - `X-Compressed-Size-MB`
-- `X-Compression-Preset` (`ebook` or `screen`)
+- `X-Compression-Preset` (`printer`, `ebook-225`, `ebook-150`, or `screen`)
+- `X-Compression-DPI` (e.g. `300`, `225`, `150`, or `default`)
+- `X-Compression-Warning` (only if the file could not be brought under 20 MB)
 
 If `COMPRESS_API_SECRET` is set, add the header:
 
@@ -132,11 +134,25 @@ If you use `COMPRESS_API_SECRET`, the frontend must also send the `x-compress-ap
 
 ## How compression works
 
-1. Upload is saved to a temporary file.
-2. Ghostscript compresses with `/ebook` preset at **300 dpi** (good quality, ~12 MB target for large decks).
-3. If the result is still over **12 MB**, Ghostscript retries with `/screen` (smaller, lower quality).
-4. The compressed PDF is returned as a download.
-5. Temporary files are deleted after the response is sent.
+Compression **prioritizes image quality first**. The API does not blindly shrink files as small as possible.
+
+**Target:** around **12 MB** when possible (roughly 10–14 MB). **12 MB is a goal, not a guaranteed exact size.** Anything under **20 MB** is acceptable if quality is better.
+
+**Strategy** — try these Ghostscript settings in order, stopping at the **least aggressive** preset that produces a file under 20 MB:
+
+| Step | Preset    | DPI   | When used                                      |
+|------|-----------|-------|------------------------------------------------|
+| 1    | `/printer` | 300   | High quality — use if result is under 20 MB    |
+| 2    | `/ebook`   | 225   | Medium-high — only if step 1 is still over 20 MB |
+| 3    | `/ebook`   | 150   | Medium — only if steps 1–2 are still over 20 MB |
+| 4    | `/screen`  | default | Aggressive fallback — only if all above are still over 20 MB |
+
+**Selection rules:**
+
+- Prefer a **larger** file under 20 MB over a tiny file with worse quality.
+- Avoid results below **8 MB** unless the source is already small or there is no better option.
+- If every candidate is still over 20 MB, return the smallest result and set `X-Compression-Warning`.
+
+Server logs show the original size, each preset/DPI attempt, candidate sizes, and which version was selected.
 
 Upload limit: **200 MB**.
-# acton-pdf-compressor

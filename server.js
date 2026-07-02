@@ -13,11 +13,18 @@ const execFileAsync = promisify(execFile);
 const app = express();
 const PORT = process.env.PORT || 3000;
 
-// 12 MB target — /screen is only used if /ebook at 300 dpi still exceeds this
-const MAX_EMAIL_SIZE_BYTES = 12 * 1024 * 1024;
-const IMAGE_DPI = 300;
+// Email-friendly max; prefer quality — 12 MB is a target, not a hard ceiling
+const MAX_ACCEPTABLE_BYTES = 20 * 1024 * 1024;
 // 200 MB upload limit
 const MAX_UPLOAD_SIZE_BYTES = 200 * 1024 * 1024;
+
+/** Least aggressive first — only run later steps if earlier outputs are still over 20 MB. */
+const COMPRESSION_STEPS = [
+  { preset: "/printer", dpi: 300, label: "printer" },
+  { preset: "/ebook", dpi: 225, label: "ebook-225" },
+  { preset: "/ebook", dpi: 150, label: "ebook-150" },
+  { preset: "/screen", dpi: null, label: "screen" },
+];
 
 const OUTPUT_FILENAME = "Acton-BR-Presentation-Email-Ready.pdf";
 
@@ -92,7 +99,7 @@ const upload = multer({
 // Helpers
 // ---------------------------------------------------------------------------
 
-/** Run Ghostscript with the given quality preset (/ebook or /screen). */
+/** Run Ghostscript with the given quality preset and optional DPI. */
 async function compressPdf(inputPath, outputPath, preset, dpi = null) {
   const args = [
     "-sDEVICE=pdfwrite",
@@ -142,40 +149,95 @@ async function cleanupFiles(...paths) {
 }
 
 /**
- * Compress with /ebook at 300 dpi first. If still over 12 MB, retry with /screen.
- * Returns { outputPath, preset, originalSize, compressedSize }.
+ * Adaptive quality-first compression.
+ * Tries presets from highest to lowest quality, stopping at the least aggressive
+ * setting that produces a file under 20 MB. Prefers larger files under 20 MB
+ * because they retain better image quality.
  */
-async function compressWithFallback(inputPath, workDir) {
+async function compressWithAdaptiveQuality(inputPath, workDir) {
   const originalSize = await getFileSizeBytes(inputPath);
+  console.log(`[compress] Original size: ${bytesToMb(originalSize)} MB`);
 
-  const ebookOutput = path.join(workDir, `ebook-${crypto.randomBytes(6).toString("hex")}.pdf`);
-  await compressPdf(inputPath, ebookOutput, "/ebook", IMAGE_DPI);
-  const ebookSize = await getFileSizeBytes(ebookOutput);
+  const candidates = [];
 
-  if (ebookSize <= MAX_EMAIL_SIZE_BYTES) {
-    return {
-      outputPath: ebookOutput,
-      preset: "ebook",
-      originalSize,
-      compressedSize: ebookSize,
-      alternateOutput: null,
-    };
+  try {
+    for (const step of COMPRESSION_STEPS) {
+      // Skip stronger steps unless every attempt so far is still over 20 MB
+      if (candidates.length > 0) {
+        const allOverMax = candidates.every((c) => c.size > MAX_ACCEPTABLE_BYTES);
+        if (!allOverMax) {
+          break;
+        }
+      }
+
+      const outputPath = path.join(
+        workDir,
+        `${step.label}-${crypto.randomBytes(6).toString("hex")}.pdf`
+      );
+      const dpiLabel = step.dpi ? String(step.dpi) : "default";
+
+      console.log(
+        `[compress] Trying ${step.label} (${step.preset}, ${dpiLabel} dpi)...`
+      );
+
+      await compressPdf(inputPath, outputPath, step.preset, step.dpi);
+      const size = await getFileSizeBytes(outputPath);
+
+      const candidate = { ...step, outputPath, size };
+      candidates.push(candidate);
+
+      console.log(
+        `[compress]   → candidate ${bytesToMb(size)} MB (${step.label}, ${dpiLabel} dpi)`
+      );
+
+      if (size <= MAX_ACCEPTABLE_BYTES) {
+        console.log(
+          `[compress]   → under 20 MB; stopping (no stronger compression needed)`
+        );
+        break;
+      }
+
+      console.log(`[compress]   → still over 20 MB; will try next preset if available`);
+    }
+  } catch (err) {
+    await cleanupFiles(...candidates.map((c) => c.outputPath));
+    throw err;
   }
 
-  // /ebook still too large — fall back to /screen
-  const screenOutput = path.join(workDir, `screen-${crypto.randomBytes(6).toString("hex")}.pdf`);
-  await compressPdf(inputPath, screenOutput, "/screen");
-  const screenSize = await getFileSizeBytes(screenOutput);
+  const underMax = candidates.filter((c) => c.size <= MAX_ACCEPTABLE_BYTES);
 
-  // Remove the oversized ebook attempt
-  await cleanupFiles(ebookOutput);
+  let selected;
+  let warning = null;
+
+  if (underMax.length > 0) {
+    // Largest under 20 MB = best quality among acceptable candidates
+    selected = underMax.reduce((best, c) => (c.size > best.size ? c : best));
+    console.log(
+      `[compress] Selected: ${selected.label} at ${bytesToMb(selected.size)} MB ` +
+        `(${selected.preset}, ${selected.dpi ?? "default"} dpi) — ` +
+        `best quality under 20 MB`
+    );
+  } else {
+    selected = candidates.reduce((best, c) => (c.size < best.size ? c : best));
+    warning = "Could not compress below 20 MB; returning smallest result.";
+    console.log(
+      `[compress] Warning: all candidates over 20 MB. ` +
+        `Selected smallest: ${selected.label} at ${bytesToMb(selected.size)} MB`
+    );
+  }
+
+  const discardPaths = candidates
+    .filter((c) => c.outputPath !== selected.outputPath)
+    .map((c) => c.outputPath);
+  await cleanupFiles(...discardPaths);
 
   return {
-    outputPath: screenOutput,
-    preset: "screen",
+    outputPath: selected.outputPath,
+    preset: selected.label,
+    dpi: selected.dpi,
     originalSize,
-    compressedSize: screenSize,
-    alternateOutput: null,
+    compressedSize: selected.size,
+    warning,
   };
 }
 
@@ -219,19 +281,24 @@ app.post(
     let outputPath = null;
 
     try {
-      const result = await compressWithFallback(inputPath, os.tmpdir());
+      const result = await compressWithAdaptiveQuality(inputPath, os.tmpdir());
       outputPath = result.outputPath;
 
       const pdfBuffer = await fs.readFile(outputPath);
 
-      res.set({
+      const headers = {
         "Content-Type": "application/pdf",
         "Content-Disposition": `attachment; filename="${OUTPUT_FILENAME}"`,
         "X-Original-Size-MB": bytesToMb(result.originalSize),
         "X-Compressed-Size-MB": bytesToMb(result.compressedSize),
         "X-Compression-Preset": result.preset,
-      });
+        "X-Compression-DPI": result.dpi ? String(result.dpi) : "default",
+      };
+      if (result.warning) {
+        headers["X-Compression-Warning"] = result.warning;
+      }
 
+      res.set(headers);
       res.send(pdfBuffer);
     } catch (err) {
       console.error("Compression failed:", err);
