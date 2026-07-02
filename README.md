@@ -2,7 +2,7 @@
 
 Standalone **fallback** PDF compression API for the [Acton BR Library](https://acton-br-library.vercel.app) app.
 
-The frontend optimizes PDFs locally first when the user selects **Compress PDF**. This API is called **only when the locally optimized file is still too large** (over ~20 MB). It preserves image quality as much as possible while getting under the email size limit — it is **not** an aggressive file crusher.
+The frontend optimizes PDFs locally first when the user selects **Compress PDF**. This API is called **only when the locally optimized file is still too large** (over ~20 MB). It uses a fast two-pass Ghostscript strategy — not multi-candidate generation.
 
 **Production URL pattern:** `https://YOUR-RENDER-SERVICE-NAME.onrender.com`
 
@@ -72,10 +72,9 @@ The `-D -` flag prints response headers so you can see:
 
 - `X-Original-Size-MB`
 - `X-Compressed-Size-MB`
-- `X-Compression-Preset` (`prepress-300`, `printer-300`, `printer-250`, etc.)
-- `X-Compression-DPI` (e.g. `300`, `250`, `225`, or `default`)
-- `X-All-Candidates` (summary of every attempt; `*` marks the selected file)
-- `X-Compression-Warning` (only if the result is under 10 MB or over 20 MB)
+- `X-Compression-Preset` (`printer` or `ebook`)
+- `X-Compression-DPI` (`200` or `175`)
+- `X-Compression-Passes` (`1` or `2`)
 
 If `COMPRESS_API_SECRET` is set, add the header:
 
@@ -137,52 +136,24 @@ If you use `COMPRESS_API_SECRET`, the frontend must also send the `x-compress-ap
 
 ## How compression works
 
-This API is a **quality-preserving fallback compressor**. It generates multiple candidate PDFs and returns the **largest / highest-quality version under 20 MB** — never the smallest.
+Fast **two-pass max** strategy — speed and reliability over exact file-size targeting.
 
-**Role in the app:**
+**Role in the app:** fallback when the Acton BR Library frontend’s local compression is still over ~20 MB.
 
-1. User clicks **Compress PDF** in Acton BR Library.
-2. The browser compresses the PDF locally first.
-3. If the result is still over ~20 MB, the app sends it here for a second pass.
-4. This API picks the best-quality output that fits under 20 MB.
+| Pass | When | Preset | DPI |
+|------|------|--------|-----|
+| 1 — Primary | Always | `/printer` | 200 |
+| 2 — Fallback | Only if pass 1 is still over 20 MB | `/ebook` | 175 |
 
-**Targets:**
+**Rules:**
 
-- Preferred range: **10–18 MB**
-- Hard max: **under 20 MB**
-- Avoid outputs under **10 MB** unless no better candidate exists
+- Maximum **2 Ghostscript passes** per request — no multi-candidate generation
+- No `/screen` preset
+- Under **20 MB** is acceptable; no exact 12 MB targeting
+- `/printer` at 200 DPI balances quality and speed better than aggressive multi-preset runs
 
-**Candidates** (always runs 1–7; runs `/screen` only if none of 1–7 are under 20 MB):
+**Response headers:** `X-Compression-Passes` shows `1` or `2`.
 
-| Step | Preset      | DPI     | Mode          |
-|------|-------------|---------|---------------|
-| 1    | `/prepress` | 300     | High quality  |
-| 2    | `/printer`  | 300     | High quality  |
-| 3    | `/printer`  | 250     | High quality  |
-| 4    | `/printer`  | 200     | High quality  |
-| 5    | `/ebook`    | 225     | High quality  |
-| 6    | `/ebook`    | 200     | High quality  |
-| 7    | `/ebook`    | 150     | More aggressive |
-| 8    | `/screen`   | default | Last resort only |
-
-**Selection rules:**
-
-1. Collect every candidate’s file size.
-2. Prefer the **largest** file in the **10–18 MB** range.
-3. If none in that range, pick the **largest file under 20 MB**.
-4. Never pick `/screen` if any other candidate is under 20 MB.
-5. If all candidates are below 10 MB, pick the largest and set `X-Compression-Warning`.
-6. If every candidate is over 20 MB, return the smallest and set `X-Compression-Warning`.
-
-High-quality candidates use bicubic downsampling and only reduce images above the target DPI. Fallback presets use more aggressive downsampling.
-
-**Response headers:**
-
-- `X-All-Candidates` — compact summary of every preset/DPI/size (`*` = selected)
-- `X-Compression-Warning` — set when the result is under 10 MB or over 20 MB
-
-Server logs show original size, each candidate, the selected file, and any warning.
-
-> **Note:** Multiple Ghostscript passes can take several minutes for large PDFs. This is expected for a fallback path used only when local compression was insufficient.
+Server logs show original size, primary output size, whether fallback was used, final size, and total processing time.
 
 Upload limit: **200 MB**.
