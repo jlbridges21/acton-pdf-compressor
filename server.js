@@ -13,17 +13,27 @@ const execFileAsync = promisify(execFile);
 const app = express();
 const PORT = process.env.PORT || 3000;
 
-// Email-friendly max; prefer quality — 12 MB is a target, not a hard ceiling
+// Quality-preserving fallback compressor — prefer larger files, not smallest
 const MAX_ACCEPTABLE_BYTES = 20 * 1024 * 1024;
+const PREFERRED_MIN_BYTES = 10 * 1024 * 1024; // ideal range: 10–18 MB
+const PREFERRED_MAX_BYTES = 18 * 1024 * 1024;
+const LOW_SIZE_BYTES = 10 * 1024 * 1024; // warn if result falls below this
 // 200 MB upload limit
 const MAX_UPLOAD_SIZE_BYTES = 200 * 1024 * 1024;
 
-/** Least aggressive first — only run later steps if earlier outputs are still over 20 MB. */
-const COMPRESSION_STEPS = [
-  { preset: "/printer", dpi: 300, label: "printer" },
-  { preset: "/ebook", dpi: 225, label: "ebook-225" },
-  { preset: "/ebook", dpi: 150, label: "ebook-150" },
-  { preset: "/screen", dpi: null, label: "screen" },
+/**
+ * Compression candidates, least aggressive first.
+ * Steps 1–7 always run. Step 8 (/screen) runs only if none of 1–7 are under 20 MB.
+ */
+const COMPRESSION_CANDIDATES = [
+  { preset: "/prepress", dpi: 300, label: "prepress-300", aggressive: false },
+  { preset: "/printer", dpi: 300, label: "printer-300", aggressive: false },
+  { preset: "/printer", dpi: 250, label: "printer-250", aggressive: false },
+  { preset: "/printer", dpi: 200, label: "printer-200", aggressive: false },
+  { preset: "/ebook", dpi: 225, label: "ebook-225", aggressive: false },
+  { preset: "/ebook", dpi: 200, label: "ebook-200", aggressive: false },
+  { preset: "/ebook", dpi: 150, label: "ebook-150", aggressive: true },
+  { preset: "/screen", dpi: null, label: "screen", aggressive: true, lastResort: true },
 ];
 
 const OUTPUT_FILENAME = "Acton-BR-Presentation-Email-Ready.pdf";
@@ -99,8 +109,8 @@ const upload = multer({
 // Helpers
 // ---------------------------------------------------------------------------
 
-/** Run Ghostscript with the given quality preset and optional DPI. */
-async function compressPdf(inputPath, outputPath, preset, dpi = null) {
+/** Build Ghostscript args with explicit image downsampling controls. */
+function buildGsArgs(inputPath, outputPath, preset, dpi, aggressive) {
   const args = [
     "-sDEVICE=pdfwrite",
     "-dCompatibilityLevel=1.4",
@@ -112,16 +122,36 @@ async function compressPdf(inputPath, outputPath, preset, dpi = null) {
 
   if (dpi) {
     args.push(
+      "-dDownsampleColorImages=true",
       `-dColorImageResolution=${dpi}`,
+      "-dDownsampleGrayImages=true",
       `-dGrayImageResolution=${dpi}`,
+      "-dDownsampleMonoImages=true",
       `-dMonoImageResolution=${dpi}`
     );
+
+    if (!aggressive) {
+      // High-quality: bicubic resampling, only downsample above target DPI
+      args.push(
+        "-dColorImageDownsampleType=/Bicubic",
+        "-dGrayImageDownsampleType=/Bicubic",
+        "-dColorImageDownsampleThreshold=1.0",
+        "-dGrayImageDownsampleThreshold=1.0",
+        "-dMonoImageDownsampleThreshold=1.0"
+      );
+    }
   }
 
   args.push(`-sOutputFile=${outputPath}`, inputPath);
+  return args;
+}
+
+/** Run Ghostscript with the given quality preset, DPI, and quality mode. */
+async function compressPdf(inputPath, outputPath, preset, dpi = null, aggressive = false) {
+  const args = buildGsArgs(inputPath, outputPath, preset, dpi, aggressive);
 
   await execFileAsync("gs", args, {
-    timeout: 5 * 60 * 1000, // 5-minute timeout for large presentations
+    timeout: 10 * 60 * 1000, // 10-minute timeout per candidate (large decks)
   });
 }
 
@@ -148,11 +178,87 @@ async function cleanupFiles(...paths) {
   );
 }
 
+function formatCandidatesSummary(candidates, selectedPath) {
+  return candidates
+    .map((c) => {
+      const tag = c.outputPath === selectedPath ? "*" : "";
+      const dpi = c.dpi ?? "default";
+      return `${c.label}@${dpi}dpi=${bytesToMb(c.size)}MB${tag}`;
+    })
+    .join("; ");
+}
+
 /**
- * Adaptive quality-first compression.
- * Tries presets from highest to lowest quality, stopping at the least aggressive
- * setting that produces a file under 20 MB. Prefers larger files under 20 MB
- * because they retain better image quality.
+ * Choose the best candidate for a quality-preserving fallback compressor.
+ *
+ * Strategy (not smallest-file wins):
+ * 1. Prefer the largest file in the 10–18 MB sweet spot.
+ * 2. Else pick the largest file under 20 MB.
+ * 3. Never pick /screen if any other candidate is under 20 MB.
+ * 4. If everything is over 20 MB, return the smallest and warn.
+ * 5. If everything under 20 MB is below 10 MB, return the largest and warn.
+ */
+function selectBestCandidate(candidates) {
+  let underMax = candidates.filter((c) => c.size <= MAX_ACCEPTABLE_BYTES);
+
+  // Avoid /screen unless it is the only option under 20 MB
+  const withoutScreen = underMax.filter((c) => c.label !== "screen");
+  if (withoutScreen.length > 0) {
+    underMax = withoutScreen;
+  }
+
+  if (underMax.length > 0) {
+    const inPreferredRange = underMax.filter(
+      (c) => c.size >= PREFERRED_MIN_BYTES && c.size <= PREFERRED_MAX_BYTES
+    );
+
+    const selected =
+      inPreferredRange.length > 0
+        ? inPreferredRange.reduce((best, c) => (c.size > best.size ? c : best))
+        : underMax.reduce((best, c) => (c.size > best.size ? c : best));
+
+    let warning = null;
+    if (underMax.every((c) => c.size < LOW_SIZE_BYTES)) {
+      warning =
+        `All candidates under 20 MB are below 10 MB; selected largest at ${bytesToMb(selected.size)} MB. PDF may still be over-compressed.`;
+    } else if (selected.size < LOW_SIZE_BYTES) {
+      warning = `Selected file is ${bytesToMb(selected.size)} MB (under 10 MB); quality may be reduced.`;
+    }
+
+    return { selected, warning };
+  }
+
+  const selected = candidates.reduce((best, c) => (c.size < best.size ? c : best));
+  return {
+    selected,
+    warning: `Could not compress below 20 MB; returning smallest result at ${bytesToMb(selected.size)} MB.`,
+  };
+}
+
+async function runCandidate(inputPath, workDir, step) {
+  const outputPath = path.join(
+    workDir,
+    `${step.label}-${crypto.randomBytes(6).toString("hex")}.pdf`
+  );
+  const dpiLabel = step.dpi ? String(step.dpi) : "default";
+
+  console.log(
+    `[compress] Trying ${step.label} (${step.preset}, ${dpiLabel} dpi, aggressive=${step.aggressive})...`
+  );
+
+  await compressPdf(inputPath, outputPath, step.preset, step.dpi, step.aggressive);
+  const size = await getFileSizeBytes(outputPath);
+
+  console.log(`[compress]   → ${bytesToMb(size)} MB`);
+
+  return { ...step, outputPath, size };
+}
+
+/**
+ * Fallback quality-preserving compression.
+ * Runs multiple Ghostscript presets, then returns the largest acceptable file
+ * under 20 MB (preferring 10–18 MB). Used when local frontend compression
+ * was not enough — not as an aggressive file crusher.
  */
 async function compressWithAdaptiveQuality(inputPath, workDir) {
   const originalSize = await getFileSizeBytes(inputPath);
@@ -161,69 +267,38 @@ async function compressWithAdaptiveQuality(inputPath, workDir) {
   const candidates = [];
 
   try {
-    for (const step of COMPRESSION_STEPS) {
-      // Skip stronger steps unless every attempt so far is still over 20 MB
-      if (candidates.length > 0) {
-        const allOverMax = candidates.every((c) => c.size > MAX_ACCEPTABLE_BYTES);
-        if (!allOverMax) {
+    for (const step of COMPRESSION_CANDIDATES) {
+      if (step.lastResort) {
+        const hasUnderMax = candidates.some((c) => c.size <= MAX_ACCEPTABLE_BYTES);
+        if (hasUnderMax) {
+          console.log("[compress] Skipping /screen — a candidate is already under 20 MB");
           break;
         }
       }
 
-      const outputPath = path.join(
-        workDir,
-        `${step.label}-${crypto.randomBytes(6).toString("hex")}.pdf`
-      );
-      const dpiLabel = step.dpi ? String(step.dpi) : "default";
-
-      console.log(
-        `[compress] Trying ${step.label} (${step.preset}, ${dpiLabel} dpi)...`
-      );
-
-      await compressPdf(inputPath, outputPath, step.preset, step.dpi);
-      const size = await getFileSizeBytes(outputPath);
-
-      const candidate = { ...step, outputPath, size };
-      candidates.push(candidate);
-
-      console.log(
-        `[compress]   → candidate ${bytesToMb(size)} MB (${step.label}, ${dpiLabel} dpi)`
-      );
-
-      if (size <= MAX_ACCEPTABLE_BYTES) {
-        console.log(
-          `[compress]   → under 20 MB; stopping (no stronger compression needed)`
-        );
-        break;
-      }
-
-      console.log(`[compress]   → still over 20 MB; will try next preset if available`);
+      candidates.push(await runCandidate(inputPath, workDir, step));
     }
   } catch (err) {
     await cleanupFiles(...candidates.map((c) => c.outputPath));
     throw err;
   }
 
-  const underMax = candidates.filter((c) => c.size <= MAX_ACCEPTABLE_BYTES);
+  const { selected, warning } = selectBestCandidate(candidates);
 
-  let selected;
-  let warning = null;
+  for (const c of candidates) {
+    const isSelected = c.outputPath === selected.outputPath;
+    console.log(
+      `[compress] Candidate: preset=${c.label} dpi=${c.dpi ?? "default"} ` +
+        `size=${bytesToMb(c.size)} MB selected=${isSelected}`
+    );
+  }
 
-  if (underMax.length > 0) {
-    // Largest under 20 MB = best quality among acceptable candidates
-    selected = underMax.reduce((best, c) => (c.size > best.size ? c : best));
-    console.log(
-      `[compress] Selected: ${selected.label} at ${bytesToMb(selected.size)} MB ` +
-        `(${selected.preset}, ${selected.dpi ?? "default"} dpi) — ` +
-        `best quality under 20 MB`
-    );
-  } else {
-    selected = candidates.reduce((best, c) => (c.size < best.size ? c : best));
-    warning = "Could not compress below 20 MB; returning smallest result.";
-    console.log(
-      `[compress] Warning: all candidates over 20 MB. ` +
-        `Selected smallest: ${selected.label} at ${bytesToMb(selected.size)} MB`
-    );
+  console.log(
+    `[compress] Selected: ${selected.label} at ${bytesToMb(selected.size)} MB ` +
+      `(${selected.preset}, ${selected.dpi ?? "default"} dpi)`
+  );
+  if (warning) {
+    console.log(`[compress] Warning: ${warning}`);
   }
 
   const discardPaths = candidates
@@ -238,6 +313,7 @@ async function compressWithAdaptiveQuality(inputPath, workDir) {
     originalSize,
     compressedSize: selected.size,
     warning,
+    allCandidatesSummary: formatCandidatesSummary(candidates, selected.outputPath),
   };
 }
 
@@ -293,6 +369,7 @@ app.post(
         "X-Compressed-Size-MB": bytesToMb(result.compressedSize),
         "X-Compression-Preset": result.preset,
         "X-Compression-DPI": result.dpi ? String(result.dpi) : "default",
+        "X-All-Candidates": result.allCandidatesSummary,
       };
       if (result.warning) {
         headers["X-Compression-Warning"] = result.warning;
